@@ -341,6 +341,10 @@ func (cli *Client) PushMulti(ctx context.Context, n *Notification, tokens []stri
 		wg.Add(1)
 		go func(token string) {
 			defer wg.Done()
+			if err := ctx.Err(); err != nil {
+				results <- result{Token: token, Err: err}
+				return
+			}
 
 			notification := n.Clone()
 			notification.DeviceToken = token

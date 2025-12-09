@@ -15,7 +15,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,7 +364,7 @@ func TestClient_Push_Error(t *testing.T) {
 				Type:        notification.Alert,
 				BundleID:    "BUNDLE_ID",
 				DeviceToken: "DEVICE_TOKEN",
-				Payload:     &Payload{APS: payload.APS{Alert: strings.Repeat("A", 4077)}}, // 20byte {"aps":"alert":{"A....."}}
+				Payload:     &Payload{APS: payload.APS{Alert: strings.Repeat("A", 4077)}}, // 20byte {"aps":{"alert":{"A....."}}}
 			},
 			"payload too large: 4097 bytes",
 		},
@@ -420,7 +422,7 @@ func TestClient_Push_Error(t *testing.T) {
 	}
 }
 
-func TestClient_Push_ErrorResponse(t *testing.T) {
+func TestClient_Push_ServerError(t *testing.T) {
 	testCases := map[string]struct {
 		statusCode int
 		reason     string
@@ -875,6 +877,189 @@ func TestClient_PushMulti(t *testing.T) {
 				}
 			} else if tc.wantFailures > 0 {
 				t.Errorf("Expected MultiError with %d failures, but didn't get a MultiError", tc.wantFailures)
+			}
+		})
+	}
+}
+
+// mockCancelRoundTripper is a mock RoundTripper that cancels a context on a specified call number.
+type mockCancelRoundTripper struct {
+	// cancelAtCall specifies which call to RoundTrip should trigger the context cancellation.
+	// If set to 0, it will never cancel.
+	cancelAtToken string
+
+	// callCount tracks the number of times RoundTrip has been called.
+	callCount int
+
+	// cancel is the context cancellation function.
+	cancel context.CancelFunc
+
+	// t is the testing object for logging.
+	t *testing.T
+	cancelDone    chan struct{} // Added: Channel to signal cancellation
+	mu            sync.Mutex    // Added: For protecting internal state if needed
+}
+
+func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	token := path.Base(r.URL.Path)
+	m.t.Logf("RoundTrip called. Request for token: %s, cancelAtToken: %s", token, m.cancelAtToken)
+
+	// Check if context is already cancelled or if another goroutine has signaled cancellation
+	select {
+	case <-r.Context().Done():
+		m.t.Logf("Context is already canceled before processing request for token: %s", token)
+		return nil, r.Context().Err()
+	case <-m.cancelDone: // If this channel is closed, cancellation has been signaled
+		m.t.Logf("Cancellation signaled via channel for token: %s", token)
+		return nil, context.Canceled // Return context.Canceled directly as it's the expected error
+	default:
+		// Not cancelled yet, proceed
+	}
+
+	if token == m.cancelAtToken {
+		m.t.Logf("Cancelling context for token: %s", token)
+		m.cancel()
+		// Only close cancelDone once to avoid panics. Use a mutex if multiple goroutines could try to close it.
+		m.mu.Lock()
+		select {
+		case <-m.cancelDone:
+			// Already closed
+		default:
+			close(m.cancelDone) // Signal cancellation to other goroutines
+		}
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
+
+	// Simulate some work, potentially checking for cancellation during this work
+	select {
+	case <-r.Context().Done():
+		m.t.Logf("Context cancelled during simulated work for token: %s", token)
+		return nil, r.Context().Err()
+	case <-time.After(1 * time.Millisecond): // Simulate work that takes a small amount of time
+		// Work completed, proceed to return success
+	case <-m.cancelDone:
+		m.t.Logf("Cancellation signaled via channel during simulated work for token: %s", token)
+		return nil, context.Canceled
+	}
+
+	// Return a dummy successful response for calls before cancellation.
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"apns-id": []string{"dummy-apns-id"}},
+		Body:       io.NopCloser(strings.NewReader(`{"reason":""}`)),
+	}, nil
+}
+
+func TestClient_PushMulti_ContextCancellation(t *testing.T) {
+	baseNotification := &Notification{
+		BundleID: "com.example.app",
+		Type:     notification.Alert,
+		Payload:  &Payload{APS: payload.APS{Alert: "test"}},
+	}
+
+	testCases := map[string]struct {
+		tokens        []string
+				cancelAtToken string
+		wantErr       bool
+		wantSuccesses int
+		wantFailures  int
+		checkErr      func(t *testing.T, err error)
+	}{
+		"1 Token, No Cancellation": {
+			tokens:        []string{"token1"},
+			cancelAtToken: "", // No cancellation
+			wantErr:       false,
+			wantSuccesses: 1,
+			wantFailures:  0,
+		},
+		"3 Tokens, Cancel on 1st Call (Sync part)": {
+			tokens:        []string{"token1", "token2", "token3"},
+			cancelAtToken: "token1",
+			wantErr:       true,
+			wantSuccesses: 0,
+			wantFailures:  0, // No MultiError, the first sync request fails.
+			checkErr: func(t *testing.T, err error) {
+				if _, ok := err.(*MultiError); ok {
+					t.Errorf("Expected a single error, not a MultiError")
+				}
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("Expected error to be context.Canceled, got %v", err)
+				}
+			},
+		},
+		"3 Tokens, Cancel on 2nd Call (Async part)": {
+			tokens:        []string{"token1", "token2", "token3"},
+			cancelAtToken: "token2",
+			wantErr:       true,
+			wantSuccesses: 1, // The first one should succeed.
+			wantFailures:  2, // The remaining two should fail.
+			checkErr: func(t *testing.T, err error) {
+				multiErr, ok := err.(*MultiError)
+				if !ok {
+					t.Fatalf("Expected error of type *MultiError, got %T", err)
+				}
+				if len(multiErr.Failures) != 2 {
+					t.Fatalf("Expected 2 failures, got %d", len(multiErr.Failures))
+				}
+				foundCanceled := false
+				for _, failureErr := range multiErr.Failures {
+					if errors.Is(failureErr, context.Canceled) {
+						foundCanceled = true
+					}
+				}
+				if !foundCanceled {
+					t.Errorf("Expected at least one failure to be context.Canceled, but none was. Failures: %v", multiErr.Failures)
+				}
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			mockTransport := &mockCancelRoundTripper{
+				cancel:        cancel,
+				cancelAtToken: tc.cancelAtToken,
+				t:             t,
+				cancelDone:    make(chan struct{}),
+			}
+
+			client, err := NewClient(
+				appleapi.DefaultHTTPClientInitializer(),
+				&MockTokenProvider{Token: "test-token"},
+				appleapi.WithTransport(mockTransport),
+			)
+			if err != nil {
+				t.Fatalf("NewClient failed: %v", err)
+			}
+			client.inner.Host = "https://localhost"
+
+			responses, err := client.PushMulti(ctx, baseNotification, tc.tokens)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.checkErr != nil {
+					tc.checkErr(t, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if len(responses) != tc.wantSuccesses {
+				t.Errorf("Expected %d successful responses, got %d", tc.wantSuccesses, len(responses))
+			}
+
+			if multiErr, ok := err.(*MultiError); ok {
+				if len(multiErr.Failures) != tc.wantFailures {
+					t.Errorf("Expected %d failures, got %d", tc.wantFailures, len(multiErr.Failures))
+				}
 			}
 		})
 	}
