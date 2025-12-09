@@ -15,7 +15,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -884,7 +886,7 @@ func TestClient_PushMulti(t *testing.T) {
 type mockCancelRoundTripper struct {
 	// cancelAtCall specifies which call to RoundTrip should trigger the context cancellation.
 	// If set to 0, it will never cancel.
-	cancelAtCall int
+	cancelAtToken string
 
 	// callCount tracks the number of times RoundTrip has been called.
 	callCount int
@@ -894,25 +896,50 @@ type mockCancelRoundTripper struct {
 
 	// t is the testing object for logging.
 	t *testing.T
+	cancelDone    chan struct{} // Added: Channel to signal cancellation
+	mu            sync.Mutex    // Added: For protecting internal state if needed
 }
 
 func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	m.callCount++
-	m.t.Logf("RoundTrip called %d time(s). Request for token: %s", m.callCount, r.URL.Path)
+	token := path.Base(r.URL.Path)
+	m.t.Logf("RoundTrip called. Request for token: %s, cancelAtToken: %s", token, m.cancelAtToken)
 
-	// Check if the context is already canceled before proceeding.
-	// This simulates a real http.Transport behavior.
-	if r.Context().Err() != nil {
-		m.t.Logf("Context is already canceled before processing request #%d", m.callCount)
+	// Check if context is already cancelled or if another goroutine has signaled cancellation
+	select {
+	case <-r.Context().Done():
+		m.t.Logf("Context is already canceled before processing request for token: %s", token)
 		return nil, r.Context().Err()
+	case <-m.cancelDone: // If this channel is closed, cancellation has been signaled
+		m.t.Logf("Cancellation signaled via channel for token: %s", token)
+		return nil, context.Canceled // Return context.Canceled directly as it's the expected error
+	default:
+		// Not cancelled yet, proceed
 	}
 
-	// Trigger cancellation at the specified call number.
-	if m.cancelAtCall > 0 && m.callCount == m.cancelAtCall {
-		m.t.Logf("Cancelling context at call #%d", m.callCount)
+	if token == m.cancelAtToken {
+		m.t.Logf("Cancelling context for token: %s", token)
 		m.cancel()
-		// Even after calling cancel, return a context error to simulate the transport
-		// aborting the request immediately.
+		// Only close cancelDone once to avoid panics. Use a mutex if multiple goroutines could try to close it.
+		m.mu.Lock()
+		select {
+		case <-m.cancelDone:
+			// Already closed
+		default:
+			close(m.cancelDone) // Signal cancellation to other goroutines
+		}
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
+
+	// Simulate some work, potentially checking for cancellation during this work
+	select {
+	case <-r.Context().Done():
+		m.t.Logf("Context cancelled during simulated work for token: %s", token)
+		return nil, r.Context().Err()
+	case <-time.After(1 * time.Millisecond): // Simulate work that takes a small amount of time
+		// Work completed, proceed to return success
+	case <-m.cancelDone:
+		m.t.Logf("Cancellation signaled via channel during simulated work for token: %s", token)
 		return nil, context.Canceled
 	}
 
@@ -933,7 +960,7 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 
 	testCases := map[string]struct {
 		tokens        []string
-		cancelAtCall  int // Which request call should trigger the cancellation (1-based). 0 means no cancellation.
+				cancelAtToken string
 		wantErr       bool
 		wantSuccesses int
 		wantFailures  int
@@ -941,14 +968,14 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 	}{
 		"1 Token, No Cancellation": {
 			tokens:        []string{"token1"},
-			cancelAtCall:  0, // No cancellation
+			cancelAtToken: "", // No cancellation
 			wantErr:       false,
 			wantSuccesses: 1,
 			wantFailures:  0,
 		},
 		"3 Tokens, Cancel on 1st Call (Sync part)": {
 			tokens:        []string{"token1", "token2", "token3"},
-			cancelAtCall:  1,
+			cancelAtToken: "token1",
 			wantErr:       true,
 			wantSuccesses: 0,
 			wantFailures:  0, // No MultiError, the first sync request fails.
@@ -963,7 +990,7 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 		},
 		"3 Tokens, Cancel on 2nd Call (Async part)": {
 			tokens:        []string{"token1", "token2", "token3"},
-			cancelAtCall:  2,
+			cancelAtToken: "token2",
 			wantErr:       true,
 			wantSuccesses: 1, // The first one should succeed.
 			wantFailures:  2, // The remaining two should fail.
@@ -994,9 +1021,10 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 			defer cancel()
 
 			mockTransport := &mockCancelRoundTripper{
-				cancel:       cancel,
-				cancelAtCall: tc.cancelAtCall,
-				t:            t,
+				cancel:        cancel,
+				cancelAtToken: tc.cancelAtToken,
+				t:             t,
+				cancelDone:    make(chan struct{}),
 			}
 
 			client, err := NewClient(
