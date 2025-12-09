@@ -879,3 +879,160 @@ func TestClient_PushMulti(t *testing.T) {
 		})
 	}
 }
+
+// mockCancelRoundTripper is a mock RoundTripper that cancels a context on a specified call number.
+type mockCancelRoundTripper struct {
+	// cancelAtCall specifies which call to RoundTrip should trigger the context cancellation.
+	// If set to 0, it will never cancel.
+	cancelAtCall int
+
+	// callCount tracks the number of times RoundTrip has been called.
+	callCount int
+
+	// cancel is the context cancellation function.
+	cancel context.CancelFunc
+
+	// t is the testing object for logging.
+	t *testing.T
+}
+
+func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	m.callCount++
+	m.t.Logf("RoundTrip called %d time(s). Request for token: %s", m.callCount, r.URL.Path)
+
+	// Check if the context is already canceled before proceeding.
+	// This simulates a real http.Transport behavior.
+	if r.Context().Err() != nil {
+		m.t.Logf("Context is already canceled before processing request #%d", m.callCount)
+		return nil, r.Context().Err()
+	}
+
+	// Trigger cancellation at the specified call number.
+	if m.cancelAtCall > 0 && m.callCount == m.cancelAtCall {
+		m.t.Logf("Cancelling context at call #%d", m.callCount)
+		m.cancel()
+		// Even after calling cancel, return a context error to simulate the transport
+		// aborting the request immediately.
+		return nil, context.Canceled
+	}
+
+	// Return a dummy successful response for calls before cancellation.
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"apns-id": []string{"dummy-apns-id"}},
+		Body:       io.NopCloser(strings.NewReader(`{"reason":""}`)),
+	}, nil
+}
+
+func TestClient_PushMulti_ContextCancellation(t *testing.T) {
+	baseNotification := &Notification{
+		BundleID: "com.example.app",
+		Type:     notification.Alert,
+		Payload:  &Payload{APS: payload.APS{Alert: "test"}},
+	}
+
+	testCases := map[string]struct {
+		tokens        []string
+		cancelAtCall  int // Which request call should trigger the cancellation (1-based). 0 means no cancellation.
+		wantErr       bool
+		wantSuccesses int
+		wantFailures  int
+		checkErr      func(t *testing.T, err error)
+	}{
+		"1 Token, No Cancellation": {
+			tokens:        []string{"token1"},
+			cancelAtCall:  0, // No cancellation
+			wantErr:       false,
+			wantSuccesses: 1,
+			wantFailures:  0,
+		},
+		"3 Tokens, Cancel on 1st Call (Sync part)": {
+			tokens:        []string{"token1", "token2", "token3"},
+			cancelAtCall:  1,
+			wantErr:       true,
+			wantSuccesses: 0,
+			wantFailures:  0, // No MultiError, the first sync request fails.
+			checkErr: func(t *testing.T, err error) {
+				if _, ok := err.(*MultiError); ok {
+					t.Errorf("Expected a single error, not a MultiError")
+				}
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("Expected error to be context.Canceled, got %v", err)
+				}
+			},
+		},
+		"3 Tokens, Cancel on 2nd Call (Async part)": {
+			tokens:        []string{"token1", "token2", "token3"},
+			cancelAtCall:  2,
+			wantErr:       true,
+			wantSuccesses: 1, // The first one should succeed.
+			wantFailures:  2, // The remaining two should fail.
+			checkErr: func(t *testing.T, err error) {
+				multiErr, ok := err.(*MultiError)
+				if !ok {
+					t.Fatalf("Expected error of type *MultiError, got %T", err)
+				}
+				if len(multiErr.Failures) != 2 {
+					t.Fatalf("Expected 2 failures, got %d", len(multiErr.Failures))
+				}
+				foundCanceled := false
+				for _, failureErr := range multiErr.Failures {
+					if errors.Is(failureErr, context.Canceled) {
+						foundCanceled = true
+					}
+				}
+				if !foundCanceled {
+					t.Errorf("Expected at least one failure to be context.Canceled, but none was. Failures: %v", multiErr.Failures)
+				}
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			mockTransport := &mockCancelRoundTripper{
+				cancel:       cancel,
+				cancelAtCall: tc.cancelAtCall,
+				t:            t,
+			}
+
+			client, err := NewClient(
+				appleapi.DefaultHTTPClientInitializer(),
+				&MockTokenProvider{Token: "test-token"},
+				appleapi.WithTransport(mockTransport),
+			)
+			if err != nil {
+				t.Fatalf("NewClient failed: %v", err)
+			}
+			client.inner.Host = "https://localhost"
+
+			responses, err := client.PushMulti(ctx, baseNotification, tc.tokens)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Expected an error, but got nil")
+				}
+				if tc.checkErr != nil {
+					tc.checkErr(t, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected no error, but got: %v", err)
+				}
+			}
+
+			if len(responses) != tc.wantSuccesses {
+				t.Errorf("Expected %d successful responses, got %d", tc.wantSuccesses, len(responses))
+			}
+
+			if multiErr, ok := err.(*MultiError); ok {
+				if len(multiErr.Failures) != tc.wantFailures {
+					t.Errorf("Expected %d failures, got %d", tc.wantFailures, len(multiErr.Failures))
+				}
+			}
+		})
+	}
+}
