@@ -362,7 +362,7 @@ func TestClient_Push_Error(t *testing.T) {
 				Type:        notification.Alert,
 				BundleID:    "BUNDLE_ID",
 				DeviceToken: "DEVICE_TOKEN",
-				Payload:     &Payload{APS: payload.APS{Alert: strings.Repeat("A", 4077)}}, // 20byte {"aps":"alert":{"A....."}}
+				Payload:     &Payload{APS: payload.APS{Alert: strings.Repeat("A", 4077)}}, // 20byte {"aps":{"alert":{"A....."}}}
 			},
 			"payload too large: 4097 bytes",
 		},
@@ -420,7 +420,7 @@ func TestClient_Push_Error(t *testing.T) {
 	}
 }
 
-func TestClient_Push_ErrorResponse(t *testing.T) {
+func TestClient_Push_ServerError(t *testing.T) {
 	testCases := map[string]struct {
 		statusCode int
 		reason     string
