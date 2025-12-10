@@ -285,6 +285,9 @@ func (cli *Client) newRequest(ctx context.Context, n *Notification, body []byte)
 //
 // This method is more efficient than calling `Push` in a loop as it utilizes
 // goroutines to send notifications concurrently.
+//
+// The first token is sent synchronously to ensure the payload and request
+// generation succeed before starting concurrent sends.
 func (cli *Client) PushMulti(ctx context.Context, n *Notification, tokens []string) ([]*Response, error) {
 	if len(tokens) == 0 {
 		return nil, errors.New("token list is empty")
