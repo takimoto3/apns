@@ -28,14 +28,7 @@ func (p Payload) MarshalJSONFast() ([]byte, error) {
 	// --- 2. CustomData ---
 	var customDataBytes []byte
 	if len(p.CustomData) > 0 {
-		ptr := customDataPool.Get().(*[]byte)
-		b := (*ptr)[:0]
-		defer func() {
-			*ptr = b
-			customDataPool.Put(ptr)
-		}()
-
-		customDataBytes, err = marshalCustomData(b, p.CustomData)
+		customDataBytes, err = marshalCustomData(p.CustomData)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +52,14 @@ func (p Payload) MarshalJSONFast() ([]byte, error) {
 	return b, nil
 }
 
-func marshalCustomData(b []byte, data map[string]any) ([]byte, error) {
+func marshalCustomData(data map[string]any) ([]byte, error) {
+	ptr := customDataPool.Get().(*[]byte)
+	b := (*ptr)[:0]
+	defer func() {
+		*ptr = b
+		customDataPool.Put(ptr)
+	}()
+
 	first := true
 	addComma := func() {
 		if !first {
@@ -90,5 +90,9 @@ func marshalCustomData(b []byte, data map[string]any) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return b, nil
+
+	result := make([]byte, len(b))
+	copy(result, b)
+
+	return result, nil
 }

@@ -347,7 +347,11 @@ func TestClient_Push_Error(t *testing.T) {
 			"BundleID is required",
 		},
 		"Empty DeviceToken": {
-			Notification{BundleID: "BUNDLE_ID", Type: notification.Alert},
+			Notification{
+				BundleID: "BUNDLE_ID",
+				Type:     notification.Alert,
+				Payload:  &Payload{APS: payload.APS{Alert: "test"}},
+			},
 			"DeviceToken is required",
 		},
 		"Invalid APNsID": {

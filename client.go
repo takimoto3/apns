@@ -156,7 +156,7 @@ func (cli *Client) Push(ctx context.Context, n *Notification) (*Response, error)
 		return nil, err
 	}
 
-	req, err := cli.newRequest(ctx, n, body)
+	req, err := cli.newRequest(ctx, n, n.DeviceToken, body)
 	if err != nil {
 		return nil, err
 	}
@@ -251,8 +251,13 @@ func (cli *Client) newBody(n *Notification) ([]byte, error) {
 	return body, nil
 }
 
-func (cli *Client) newRequest(ctx context.Context, n *Notification, body []byte) (*http.Request, error) {
-	path := cli.inner.Host + Path + url.PathEscape(n.DeviceToken)
+func (cli *Client) newRequest(ctx context.Context, n *Notification, deviceToken string, body []byte) (*http.Request, error) {
+	// Validate DeviceToken (non-empty only)
+	if deviceToken == "" {
+		return nil, errors.New("DeviceToken is required")
+	}
+
+	path := cli.inner.Host + Path + url.PathEscape(deviceToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -298,7 +303,6 @@ func (cli *Client) PushMulti(ctx context.Context, n *Notification, tokens []stri
 	successes := make([]*Response, 0, len(tokens))
 
 	firstToken := tokens[0]
-	n.DeviceToken = firstToken
 	if err := n.Validate(); err != nil {
 		return nil, err
 	}
@@ -310,7 +314,7 @@ func (cli *Client) PushMulti(ctx context.Context, n *Notification, tokens []stri
 	if err != nil {
 		return nil, err
 	}
-	req, err := cli.newRequest(ctx, n, body)
+	req, err := cli.newRequest(ctx, n, firstToken, body)
 	if err != nil {
 		return nil, err
 	}
@@ -349,10 +353,7 @@ func (cli *Client) PushMulti(ctx context.Context, n *Notification, tokens []stri
 				return
 			}
 
-			notification := n.Clone()
-			notification.DeviceToken = token
-
-			req, err := cli.newRequest(ctx, notification, body)
+			req, err := cli.newRequest(ctx, n, token, body)
 			if err != nil {
 				results <- result{Token: token, Err: err}
 				return

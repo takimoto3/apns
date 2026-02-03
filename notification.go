@@ -89,11 +89,6 @@ func (n *Notification) Validate() error {
 	if n.BundleID == "" {
 		return errors.New("BundleID is required")
 	}
-	// Validate DeviceToken (non-empty only)
-	if n.DeviceToken == "" {
-		return errors.New("DeviceToken is required")
-	}
-
 	if n.Type == "" {
 		return errors.New("apns-push-type is required")
 	}
@@ -136,9 +131,4 @@ func (n *Notification) Validate() error {
 	}
 
 	return nil
-}
-
-func (n *Notification) Clone() *Notification {
-	c := *n
-	return &c
 }

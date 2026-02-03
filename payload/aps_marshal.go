@@ -254,7 +254,11 @@ func (aps APS) MarshalJSONFast() ([]byte, error) {
 	}
 
 	b = append(b, '}')
-	return b, nil
+
+	result := make([]byte, len(b))
+	copy(result, b)
+
+	return result, nil
 }
 
 // EncodeValue is a helper function that recursively encodes a value into a JSON byte slice.

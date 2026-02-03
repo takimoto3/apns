@@ -123,5 +123,8 @@ func (a Alert) MarshalJSONFast() ([]byte, error) {
 	}
 	b = append(b, '}')
 
-	return b, nil
+	result := make([]byte, len(b))
+	copy(result, b)
+
+	return result, nil
 }

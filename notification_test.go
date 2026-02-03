@@ -91,14 +91,6 @@ func TestNotification_Validate(t *testing.T) {
 			expectErr:   true,
 			errContains: "BundleID is required",
 		},
-		"Missing DeviceToken": {
-			notification: &apns.Notification{
-				BundleID: "com.example.app",
-				Type:     notification.Alert,
-			},
-			expectErr:   true,
-			errContains: "DeviceToken is required",
-		},
 		"Missing PushType": {
 			notification: &apns.Notification{
 				BundleID:    "com.example.app",
