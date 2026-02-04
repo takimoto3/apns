@@ -17,7 +17,6 @@ import (
 	"net/http/httptest"
 	"path"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -348,7 +347,11 @@ func TestClient_Push_Error(t *testing.T) {
 			"BundleID is required",
 		},
 		"Empty DeviceToken": {
-			Notification{BundleID: "BUNDLE_ID", Type: notification.Alert},
+			Notification{
+				BundleID: "BUNDLE_ID",
+				Type:     notification.Alert,
+				Payload:  &Payload{APS: payload.APS{Alert: "test"}},
+			},
 			"DeviceToken is required",
 		},
 		"Invalid APNsID": {
@@ -888,16 +891,11 @@ type mockCancelRoundTripper struct {
 	// If set to 0, it will never cancel.
 	cancelAtToken string
 
-	// callCount tracks the number of times RoundTrip has been called.
-	callCount int
-
 	// cancel is the context cancellation function.
 	cancel context.CancelFunc
 
 	// t is the testing object for logging.
 	t *testing.T
-	cancelDone    chan struct{} // Added: Channel to signal cancellation
-	mu            sync.Mutex    // Added: For protecting internal state if needed
 }
 
 func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -909,9 +907,6 @@ func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, err
 	case <-r.Context().Done():
 		m.t.Logf("Context is already canceled before processing request for token: %s", token)
 		return nil, r.Context().Err()
-	case <-m.cancelDone: // If this channel is closed, cancellation has been signaled
-		m.t.Logf("Cancellation signaled via channel for token: %s", token)
-		return nil, context.Canceled // Return context.Canceled directly as it's the expected error
 	default:
 		// Not cancelled yet, proceed
 	}
@@ -919,15 +914,6 @@ func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, err
 	if token == m.cancelAtToken {
 		m.t.Logf("Cancelling context for token: %s", token)
 		m.cancel()
-		// Only close cancelDone once to avoid panics. Use a mutex if multiple goroutines could try to close it.
-		m.mu.Lock()
-		select {
-		case <-m.cancelDone:
-			// Already closed
-		default:
-			close(m.cancelDone) // Signal cancellation to other goroutines
-		}
-		m.mu.Unlock()
 		return nil, context.Canceled
 	}
 
@@ -938,9 +924,6 @@ func (m *mockCancelRoundTripper) RoundTrip(r *http.Request) (*http.Response, err
 		return nil, r.Context().Err()
 	case <-time.After(1 * time.Millisecond): // Simulate work that takes a small amount of time
 		// Work completed, proceed to return success
-	case <-m.cancelDone:
-		m.t.Logf("Cancellation signaled via channel during simulated work for token: %s", token)
-		return nil, context.Canceled
 	}
 
 	// Return a dummy successful response for calls before cancellation.
@@ -960,7 +943,7 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 
 	testCases := map[string]struct {
 		tokens        []string
-				cancelAtToken string
+		cancelAtToken string
 		wantErr       bool
 		wantSuccesses int
 		wantFailures  int
@@ -1024,7 +1007,6 @@ func TestClient_PushMulti_ContextCancellation(t *testing.T) {
 				cancel:        cancel,
 				cancelAtToken: tc.cancelAtToken,
 				t:             t,
-				cancelDone:    make(chan struct{}),
 			}
 
 			client, err := NewClient(
